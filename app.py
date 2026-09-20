@@ -1864,6 +1864,13 @@ def _selftest() -> int:
     """`--selftest`：不开窗口，直接检查打包后的路径/引擎/翻译是否正常。
 
     打包成 windowed exe 后没有控制台，所以结果同时写到 stdout 和日志文件。
+
+    设计约束：**自检绝不能触发联网下载**。没有本地模型时只报告缺模型并跳过
+    翻译检查（否则在一个干净的目录里会卡十几分钟下载语言模型，
+    看起来就像程序死机了）。
+
+    注：PACKAGES_DIR 在模块顶部就通过 ARGOS_PACKAGES_DIR 固定成程序自己的目录了，
+    外部环境变量影响不到（这是刻意的：数据一律跟着程序走）。
     """
     lines: list[str] = []
 
@@ -1900,8 +1907,6 @@ def _selftest() -> int:
     t0 = time.time()
     count = ENGINE.installed_count()
     say(f"installed     : {count} models  ({time.time()-t0:.2f}s)")
-    if count == 0:
-        problems.append("no translation models found")
 
     import minisbd.models as _mm
     onnx = [f for f in os.listdir(os.path.join(CACHE_DIR, "minisbd"))
@@ -1921,6 +1926,29 @@ def _selftest() -> int:
         say(f"  {flag} {text[:24]:<26} -> {got} (want {want})")
         if got != want:
             problems.append(f"detect {text[:12]!r} gave {got}")
+
+    # 没有模型时到此为止。
+    # 之前这里会继续往下走，触发"缺模型 → 联网下载"，在一个干净的目录里会
+    # 卡住十几分钟（下载 80-160 MB/语言对），自检看起来就像死机了。
+    # 自检的职责是验证"程序本身是否正常"，不是去装模型。
+    if count == 0:
+        say("")
+        say("--- translation ---")
+        say("  SKIPPED: 本地没有语言模型")
+        say(f"  模型目录: {PACKAGES_DIR}")
+        say("  装入方式（任选其一）：")
+        say("    1) 把语言模型包解压到 models/packages/ 下")
+        say("    2) 启动程序 → 底栏「管理模型」→ 刷新清单 → 下载并安装")
+        say("")
+        say("SELFTEST PASSED (未安装模型，已跳过翻译检查)")
+        log.info("selftest finished without models; translation checks skipped")
+        try:
+            with open(os.path.join(LOG_DIR, "selftest.txt"), "w",
+                      encoding="utf-8") as fh:
+                fh.write("\n".join(lines) + "\n")
+        except OSError:
+            pass
+        return 1 if problems else 0
 
     say("")
     say("--- translation (offline, using local models) ---")

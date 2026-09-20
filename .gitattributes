@@ -1,0 +1,20 @@
+# 仓库里统一用 LF，检出到 Windows 时再转 CRLF，避免换行符噪音进 diff
+* text=auto eol=lf
+
+# 二进制资源别做换行转换
+*.ico binary
+*.png binary
+*.onnx binary
+*.model binary
+*.bin binary
+*.exe binary
+*.7z binary
+*.zip binary
+
+# 这些必须是 CRLF，否则在 Windows 上跑不了
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 让 GitHub 语言统计正确识别
+*.py text linguist-language=Python
