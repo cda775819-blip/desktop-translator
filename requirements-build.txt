@@ -1,0 +1,5 @@
+# 构建期额外依赖（不进最终产物）
+-r requirements.txt
+
+pyinstaller>=6.10
+pillow>=10          # 只用于生成图标 gen_icon.py

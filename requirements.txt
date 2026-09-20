@@ -1,0 +1,19 @@
+# 运行期依赖（应用本身需要的）
+# 注意：argostranslate 在 PyPI 上声明了 stanza 和 spacy 作为必需依赖，
+# 但翻译已转好的 CTranslate2 模型根本用不到它们（它们只在"把别的格式的模型
+# 转成 CTranslate2"和"用 stanza 做分句"时才需要，本应用两者都不用）。
+# 装上会让 import 从 0.9 秒变成 50 秒，并且把打包体积从 180 MB 抬到 1.5 GB。
+# 所以这里显式列出真正需要的，并配合 patch_deps.py 把上游的强制导入改成惰性。
+argostranslate==1.11.0
+ctranslate2>=4.8,<5
+sentencepiece>=0.2
+minisbd>=0.9.5
+onnxruntime>=1.20
+sacremoses>=0.1
+packaging>=24
+langdetect>=1.0.9
+
+# 可选：如果打算用 bat/脚本方式跑（而不是打包成 exe），
+# 且不想打补丁，那就装下面这两个，代价是启动慢约 50 秒：
+# stanza>=1.10
+# spacy>=3.8

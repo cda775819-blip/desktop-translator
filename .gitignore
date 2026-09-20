@@ -1,0 +1,29 @@
+# 翻译模型：单个包几十到几百 MB，100 个共约 9.6 GB。
+# GitHub 单文件硬限 100 MB，仓库里绝不能放。
+# 模型在 Release 里另发，或运行时自动下载。
+models/
+**/models/packages/
+
+# 打包产物
+build/
+dist/
+_internal/
+*.exe
+*.pdb
+
+# 运行时数据
+cache/
+logs/
+config/settings.json
+logs/selftest.txt
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# 临时探针输出
+*.log
+probe_output/
