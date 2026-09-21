@@ -116,10 +116,18 @@ for _d in (PACKAGES_DIR, CONFIG_DIR, LOG_DIR, CACHE_DIR):
     except OSError:
         pass
 
-os.environ["ARGOS_PACKAGES_DIR"] = PACKAGES_DIR
-# XDG_* 必须在 import argostranslate.settings 之前生效
 os.environ.setdefault("XDG_CACHE_HOME", CACHE_DIR)
 os.environ.setdefault("XDG_DATA_HOME", os.path.join(DATA_ROOT, "data"))
+# 这一行是**关键**，别删：argostranslate.settings 在 import 时读它来决定
+# 去哪儿找已安装的模型包。少了它，程序会去看 XDG_DATA_HOME 下的默认位置
+# （一个空目录），结果是 100 个模型一个都不认识 —— 实测踩过，
+# 表现为"目录里有 100 个包，但 get_installed_packages() 返回 0"。
+os.environ["ARGOS_PACKAGES_DIR"] = PACKAGES_DIR
+# argostranslate 会把索引写到 XDG_DATA_HOME/argos-translate。
+# 在这里算一次，缓存管理模块直接消费，不去猜环境变量（setdefault 之上
+# 可能还有外部设的值）。
+# 注意顺序：XDG_* 与 ARGOS_PACKAGES_DIR 都必须在上面的 import 之前生效。
+ARGOS_DATA_DIR = os.path.join(os.environ["XDG_DATA_HOME"], "argos-translate")
 
 
 # ======================================================================
@@ -537,7 +545,11 @@ class Engine:
 
     # -- 翻译对象 ------------------------------------------------------
     def _translation(self, src: str, tgt: str):
-        """带缓存的 get_translation_from_codes，找不到返回 None。"""
+        """带缓存的 get_translation_from_codes，找不到返回 None。
+
+        只缓存"成功拿到对象"的结果。失败（None）不入缓存 —— 否则一次瞬时
+        故障会让这个语言对在本进程内**永久**不可用，除非重启程序。
+        """
         key = (src, tgt)
         with self._lock:
             if key in self._translations:
@@ -548,7 +560,9 @@ class Engine:
             obj = argos_translate.get_translation_from_codes(src, tgt)
         except Exception:
             log.exception("get_translation_from_codes(%s,%s) failed", src, tgt)
-            obj = None
+            return None                       # 不缓存失败
+        if obj is None:
+            return None                       # 语言图里确实没有，下次还会再问
         with self._lock:
             self._translations[key] = obj
         return obj
@@ -581,13 +595,26 @@ class Engine:
 
     # -- 可下载清单（需要联网，只在用户要求时调用）---------------------
     def refresh_available(self, progress=None) -> int:
+        """拉取可下载清单。
+
+        必须校验"拉到了东西"：update_package_index() 在失败时是**静默**的
+        （下载出错只写日志、不抛异常）。如果不检查，断网时会把一个空清单
+        当成有效清单缓存下来 —— 之后 _find_available 永远返回 None，
+        用户看到的是"官方索引里没有 en → zh"，而真实原因是网络挂了。
+        """
         if not HAS_ENGINE:
             raise RuntimeError("翻译引擎未安装")
         if progress:
             progress("正在获取模型清单…")
         argos_package.update_package_index()
+        available = list(argos_package.get_available_packages())
+        if not available:
+            raise NoModelError(
+                "获取到的模型清单是空的，通常表示网络不通或索引源不可用。\n"
+                "本次结果不会被缓存，请检查网络后重试。"
+            )
         with self._lock:
-            self._available = list(argos_package.get_available_packages())
+            self._available = available
             return len(self._available)
 
     def _find_available(self, src: str, tgt: str):
@@ -803,7 +830,740 @@ def save_settings(data: dict) -> None:
 
 
 # ======================================================================
-# 7. 界面
+# 7. 缓存管理
+# ======================================================================
+#
+# 这个程序在磁盘上留下好几摊东西，来源不同、能不能删也不同。所以每项都带一个
+# **保留等级**（retention），删除入口按等级决定放不放行：
+#
+#   ASSET        用户资产   翻译模型。删了要重新下几十到几百 MB。
+#                           **绝不提供删除** —— 接口层就没有这个可能。
+#   USER_RECORD  用户记录   翻译历史。可以删，但删了**不可恢复**，
+#                           所以界面必须单独确认，不能和缓存混在一个按钮里。
+#   DISPOSABLE   可再生     分句模型 / 清单索引 / 日志。删了下次自动重建。
+#
+# 为什么不是"历史也塞进 DISPOSABLE"：那样界面一个"清理缓存"按钮就把用户的
+# 翻译记录一起清掉了，而它既不可恢复、也不是缓存。
+#
+# 报告与删除分开：
+#   inventory()   报告**所有**占空间的东西（含不可删的），让用户看得见。
+#   clear()       只删 DISPOSABLE。
+#   purge()       只删 USER_RECORD（不可恢复，调用方负责确认）。
+#
+# 历史的删除**委托**给 HistoryStore：历史的内存状态在它那里，绕过它直接删文件
+# 会让它的缓存失效（文件删了、内存还记着）。
+
+import os                        # noqa: E402
+import shutil                    # noqa: E402
+import time as _time             # noqa: E402
+
+
+class Retention:
+    """一项磁盘数据的保留等级。字符串值方便直接显示和比较。"""
+
+    ASSET = "asset"                # 用户资产，不提供删除
+    USER_RECORD = "user_record"    # 用户记录，可删但不可恢复
+    DISPOSABLE = "disposable"      # 可再生，删了会重建
+
+    LABELS = {
+        ASSET: "用户资产 · 不清理",
+        USER_RECORD: "用户记录 · 删除不可恢复",
+        DISPOSABLE: "可再生 · 可清理",
+    }
+
+
+class CacheItem:
+    """一项磁盘数据的事实：在哪、多大、是什么、属于哪个保留等级。"""
+
+    __slots__ = ("name", "label", "path", "purpose", "retention", "size")
+
+    def __init__(self, name, label, path, purpose, retention, size=0):
+        self.name = name
+        self.label = label
+        self.path = path
+        self.purpose = purpose
+        self.retention = retention
+        self.size = size
+
+    @property
+    def disposable(self) -> bool:
+        """兼容旧调用：界面用它判断能不能出现在"清理缓存"里。"""
+        return self.retention == Retention.DISPOSABLE
+
+    @property
+    def deletable(self) -> bool:
+        """凡不是用户资产的，都提供了删除入口（但确认方式不同）。"""
+        return self.retention != Retention.ASSET
+
+    @property
+    def retention_label(self) -> str:
+        return Retention.LABELS.get(self.retention, self.retention)
+
+    def __repr__(self):
+        return (f"CacheItem({self.name!r}, {self.size} B, "
+                f"{self.retention})")
+
+
+class CacheManager:
+    """磁盘数据的事实来源（source of truth）。
+
+    对外四个动作：
+        inventory()          报告所有项目及大小（含不可删的用户资产）
+        disposables()        只报告可再生的
+        clear(names=None)    删除指定的可再生项，返回 ClearReport
+        purge(names=None)    删除指定的用户记录（历史），返回 ClearReport
+
+    约束（调用方必须知道的）：
+      * inventory() 会遍历整个 models 目录，实测约 350 ms / 20 GB 量级。
+        **不要在 UI 线程同步调用**，用它包一层线程或先看 cached_inventory()。
+      * clear() / purge() 允许删除"正在被引用的文件"：删不掉时会改名成
+        .trash-* 并记入 deferred，此时空间已经释放（NTFS 允许改名被占用的
+        文件），真正清空发生在下次启动的 sweep_deferred()。
+      * clear() 只接受 DISPOSABLE，purge() 只接受 USER_RECORD，两者都不接受
+        用户资产。传错会抛 KeyError —— 故意的，删除入口不该存在误删资产的可能。
+      * 用户记录的删除**委托**给 history_store：历史的内存状态在它那里，
+        绕过它删文件会让它缓存失效。
+    """
+
+    def __init__(self, data_root, cache_dir, packages_dir, log_dir, data_dir):
+        """所有位置都由调用方传入。
+
+        刻意不在这里读 XDG_DATA_HOME：环境变量是隐藏的输入，会让这个模块
+        依赖 import 顺序、也没法在测试里指到别处。路径属于 interface。
+
+        历史存储通过 set_history() 注入，而不是构造参数 —— 因为 CACHE 单例
+        在本段就建好了，而 HistoryStore 定义在下一段。
+        """
+        self._history = None
+        self._entries = [
+            ("models", "翻译模型", packages_dir, Retention.ASSET,
+             "各语言对的翻译模型。删除后需要重新下载（每对 80–160 MB）。"),
+            ("minisbd", "分句模型", os.path.join(cache_dir, "minisbd"),
+             Retention.DISPOSABLE,
+             "把长文切成句子的 onnx 模型。随程序预置一份，缺失时会重新下载。"),
+            ("argos-cache", "模型清单与暂存",
+             os.path.join(cache_dir, "argos-translate"), Retention.DISPOSABLE,
+             "可下载模型的下标索引、下载中转文件。删除后下次刷新清单时重建。"),
+            ("argos-data", "运行时数据", data_dir, Retention.DISPOSABLE,
+             "argostranslate 自己写的数据目录（索引副本等）。"),
+            ("logs", "运行日志", log_dir, Retention.DISPOSABLE,
+             "app.log 与 selftest.txt。删了只影响事后排查问题。"),
+        ]
+        self._roots = [packages_dir, cache_dir, log_dir, data_dir]
+        self._inventory: list[CacheItem] | None = None
+        self._stamp = 0.0
+
+    # -- 报告 ----------------------------------------------------------
+
+    def set_history(self, store) -> None:
+        """注入历史存储。
+
+        必须在第一次 inventory() 之前调用，否则历史不会出现在清单里。
+        注入而不是构造参数：CACHE 单例在本段就建好了，HistoryStore 在下一段。
+        """
+        self._history = store
+        self._inventory = None          # 让下次 inventory() 带上历史
+
+    def inventory(self, force: bool = False) -> list[CacheItem]:
+        """列出所有项目（含不可删的模型），附带大小。
+
+        结果会被缓存；目录变动后用 force=True 或 refresh() 重算。
+        """
+        if self._inventory is not None and not force:
+            return list(self._inventory)
+        items = []
+        for name, label, path, retention, purpose in self._entries:
+            items.append(CacheItem(name, label, path, purpose, retention,
+                                   measure_path(path)))
+        if self._history is not None:
+            try:
+                st = self._history.summary()
+                items.append(CacheItem(
+                    "history", "翻译历史", st.path,      # path
+                    "你翻译过的原文与译文。删了不可恢复；"  # purpose（第 4 个）
+                    f"上限 {st.max_entries} 条 / "
+                    f"{_human(st.max_bytes)}，超了自动淘汰最旧的。",
+                    Retention.USER_RECORD,               # retention（第 5 个）
+                    st.bytes))
+            except Exception:
+                log.exception("history summary failed")
+        self._inventory = items
+        self._stamp = _time.time()
+        return list(items)
+
+    def disposables(self, force: bool = False) -> list[CacheItem]:
+        """只列出可再生的缓存项 —— 删除入口只认这些名字。"""
+        return [i for i in self.inventory(force) if i.disposable]
+
+    def cached_inventory(self) -> list[CacheItem] | None:
+        """如果已经算过就直接给，否则 None。给 UI 做"先显示旧的再刷新"。"""
+        return list(self._inventory) if self._inventory is not None else None
+
+    def total_size(self, force: bool = False) -> int:
+        return sum(i.size for i in self.inventory(force))
+
+    def disposable_size(self, force: bool = False) -> int:
+        return sum(i.size for i in self.disposables(force))
+
+    def refresh(self) -> list[CacheItem]:
+        return self.inventory(force=True)
+
+    def sweep_deferred(self) -> int:
+        """清掉上次删不掉的 .trash-* 残留。启动时调一次。
+
+        用递归遍历而不是"按已知路径猜父目录"：残留可能出现在任何一层，
+        而且它所在的原目录本身可能已经被删掉了（父目录没了就永远猜不到）。
+
+        返回删掉的条目数。仍被占用的会留着，下次启动再试。
+        """
+        removed = 0
+        seen: set[str] = set()
+        for root_path in self._roots:
+            # 覆盖 root_path 自身 + 它的父目录（残留是"原地改名"，可能就在旁边）
+            for base in (root_path, os.path.dirname(root_path)):
+                if not base or base in seen or not os.path.isdir(base):
+                    continue
+                seen.add(base)
+                for root, dirs, names in os.walk(base, onerror=lambda e: None):
+                    victims = [n for n in dirs + names if ".trash-" in n]
+                    for n in victims:
+                        victim = os.path.join(root, n)
+                        try:
+                            if os.path.isdir(victim):
+                                shutil.rmtree(victim)
+                            else:
+                                os.remove(victim)
+                            removed += 1
+                            log.info("swept deferred deletion: %s", victim)
+                        except OSError:
+                            pass                  # 还被占用，下次启动再说
+        if removed:
+            self._inventory = None
+        return removed
+
+    # -- 删除 ----------------------------------------------------------
+
+    def _resolve(self, names, wanted: str):
+        """挑出要删的项。按保留等级过滤，等级不符就报错。
+
+        等级不符时报错而不是静默跳过：调用方传错名字应当立刻发现，
+        而不是以为删掉了。
+        """
+        pool = {i.name: i for i in self.inventory(force=True)
+                if i.retention == wanted}
+        if names is None:
+            return list(pool.values())
+        targets = []
+        for n in names:
+            if n not in pool:
+                why = ("用户资产（翻译模型）不提供删除"
+                       if n == "models" else
+                       f"它不是{'可再生缓存' if wanted == Retention.DISPOSABLE else '用户记录'}")
+                raise KeyError(f"{n!r} 不能这样删除：{why}。"
+                               f"可用：{sorted(pool)}")
+            targets.append(pool[n])
+        return targets
+
+    def clear(self, names=None) -> "ClearReport":
+        """删除指定的**可再生**项。
+
+        names=None 表示全部可再生项。传别的名字（如 "models" 或 "history"）
+        会抛 KeyError —— 故意的：一个"清理缓存"按钮不该能删掉用户资产或记录。
+        用户记录要用 purge()。
+        """
+        return self._delete(self._resolve(names, Retention.DISPOSABLE))
+
+    def purge(self, names=None) -> "ClearReport":
+        """删除指定的**用户记录**（历史）。
+
+        与 clear() 分开是因为语义不同：这里删掉的**不可恢复**，调用方必须先
+        向用户确认。机制（删-或-改名-延后清理）是共用的。
+        """
+        return self._delete(self._resolve(names, Retention.USER_RECORD))
+
+    def _delete(self, targets) -> "ClearReport":
+        """共用的删除机制。历史那一条委托给 store，别绕过它删文件。"""
+        report = ClearReport()
+        for item in targets:
+            if item.name == "history" and self._history is not None:
+                # 委托：历史的内存状态在 store 里，直接删文件会让它缓存失效
+                try:
+                    before = item.size
+                    outcome = self._history.purge()
+                except Exception as exc:
+                    log.exception("history purge failed")
+                    report.blocked.append(item.path)
+                    continue
+                if outcome:
+                    report.cleared.append(item.name)
+                    report.freed += before
+                else:
+                    report.blocked.append(item.path)
+                continue
+
+            freed, failures = _remove_tree(item.path)
+            report.freed += freed
+            report.cleared.append(item.name)
+            for path in failures:
+                # 删不掉（多半是被当前进程引用）：改名释放空间，下次启动再清。
+                # _defer 返回**改名后**的路径 —— 空间要按新路径算，而且报告里
+                # 必须给出真实存在的位置，否则用户按旧路径去找会找不到。
+                moved = _defer(path)
+                if moved:
+                    report.deferred.append(moved)
+                    report.freed += _size_of(moved)
+                else:
+                    report.blocked.append(path)
+        self._inventory = None
+        log.info("cache delete: cleared=%s freed=%d deferred=%d blocked=%d",
+                 report.cleared, report.freed, len(report.deferred),
+                 len(report.blocked))
+        return report
+
+
+class ClearReport:
+    """一次清理的结果。名字都要能直接显示给用户。"""
+
+    __slots__ = ("freed", "cleared", "deferred", "blocked")
+
+    def __init__(self):
+        self.freed = 0
+        self.cleared: list[str] = []
+        self.deferred: list[str] = []      # 被占用，已改名，下次启动清
+        self.blocked: list[str] = []       # 既删不掉也改不了名
+
+    def summary(self) -> str:
+        parts = [f"释放 {_human(self.freed)}"]
+        if self.deferred:
+            parts.append(f"{len(self.deferred)} 个文件被占用，重启后自动清除")
+        if self.blocked:
+            parts.append(f"{len(self.blocked)} 个文件无法删除")
+        return "，".join(parts)
+
+
+# --- 内部实现（不属于接口） -------------------------------------------
+
+def _measure(path: str) -> tuple[int, int]:
+    """返回 (总字节, 文件数)。目录不存在按 0 处理，不抛异常。"""
+    if not os.path.isdir(path):
+        return 0, 0
+    total = 0
+    files = 0
+    for root, _dirs, names in os.walk(path, onerror=lambda e: None):
+        for n in names:
+            try:
+                total += os.path.getsize(os.path.join(root, n))
+                files += 1
+            except OSError:
+                pass
+    return total, files
+
+
+def measure_path(path: str) -> int:
+    """报告一项占多少字节。**文件也算** —— 历史就是一个文件，
+    只用 _measure（只管目录）会把它报成 0，界面上看起来像没占空间。"""
+    return _size_of(path)
+
+
+def _size_of(path: str) -> int:
+    if os.path.isdir(path):
+        return _measure(path)[0]
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def _remove_tree(path: str) -> tuple[int, list[str]]:
+    """尽力删除。返回 (已释放字节, 删不掉的路径列表)。
+
+    不用 shutil.rmtree(ignore_errors=True)：那样拿不到"哪些没删掉"，
+    而我们需要据此决定改名还是上报。
+    """
+    if not os.path.exists(path):
+        return 0, []
+    freed = 0
+    failures: list[str] = []
+
+    if os.path.isfile(path):
+        try:
+            size = os.path.getsize(path)
+            os.remove(path)
+            return size, []
+        except OSError:
+            return 0, [path]
+
+    for root, dirs, names in os.walk(path, topdown=False, onerror=lambda e: None):
+        for n in names:
+            f = os.path.join(root, n)
+            try:
+                size = os.path.getsize(f)
+                os.remove(f)
+                freed += size
+            except OSError:
+                failures.append(f)
+        for d in dirs:
+            try:
+                os.rmdir(os.path.join(root, d))
+            except OSError:
+                pass
+    try:
+        os.rmdir(path)
+    except OSError:
+        pass
+    return freed, failures
+
+
+def _defer(path: str) -> str | None:
+    """把删不掉的文件改名，先释放空间，留到下次启动清。
+
+    成功返回**改名后**的路径，失败返回 None。返回新路径而不是 bool，
+    是因为调用方需要它去统计大小、并让用户找得到文件。
+    """
+    target = f"{path}.trash-{int(_time.time())}"
+    try:
+        os.rename(path, target)
+        return target
+    except OSError:
+        return None
+
+
+def _human(n: int) -> str:
+    step = 1024.0
+    v = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if v < step or unit == "GB":
+            return f"{v:.0f} {unit}" if unit == "B" else f"{v:.1f} {unit}"
+        v /= step
+    return f"{v:.1f} GB"
+
+
+# 进程内单例：磁盘数据的事实只该有一份，界面和自检都读它。
+# ARGOS_DATA_DIR 由 app.py 顶部算出（它知道 XDG_DATA_HOME 的最终值），
+# 这里只消费，不去猜。
+# HISTORY 定义在下一段（翻译历史），所以这里先建、稍后回填 —— 见 set_history()。
+CACHE = CacheManager(DATA_ROOT, CACHE_DIR, PACKAGES_DIR, LOG_DIR, ARGOS_DATA_DIR)
+
+
+# ======================================================================
+# 8. 翻译历史
+# ======================================================================
+#
+# 历史**不是缓存**：缓存删了会重建，历史删了就没了。所以它单独一个模块，
+# 自己拥有记录语义和删除动作。
+#
+# 存储形态：一行一条 JSON（JSONL）。
+#   为什么不是一个大 JSON 数组：追加式写入只需要 append，崩在写一半也只毁掉
+#   最后一行；而重写整个数组的话，崩在写一半会毁掉全部历史。
+#
+# 两条上限同时生效（缺一个都会漏）：
+#   MAX_ENTRIES  条数上限    —— 防止"每次都很短但次数极多"
+#   MAX_BYTES    字节上限    —— 防止"次数不多但每次都是几十万字的长文"
+# 超限时从**最旧**的一端淘汰。单条内容永远完整保存、不截断。
+#
+# 写入契约（调用方必须知道）：
+#   record() **永不抛异常**。它的调用点在翻译成功之后，那里抛异常会让用户
+#   看到"翻译失败"，而翻译其实成功了。失败通过 RecordOutcome 返回。
+
+import json                      # noqa: E402
+import os                        # noqa: E402
+import time as _time             # noqa: E402
+
+# _defer 来自上面的"缓存管理"段落 —— 复用同一套"删不掉就改名释放空间"的策略，
+# 而不是再写一遍。拼接后它们在同一模块里，所以直接用。
+# （_defer 定义在 cache_section.py，由 splice_cache.py 拼在 6 段。）
+
+HISTORY_VERSION = 1
+
+DEFAULT_MAX_ENTRIES = 200
+DEFAULT_MAX_BYTES = 8 * 1024 * 1024      # 8 MB
+
+
+class HistoryEntry:
+    """一条历史记录。字段是稳定的：界面、自检、缓存报告都读它。"""
+
+    __slots__ = ("src", "tgt", "source", "target", "ts", "elapsed", "truncated")
+
+    def __init__(self, src, tgt, source, target, ts, elapsed=0.0,
+                 truncated=False):
+        self.src = src
+        self.tgt = tgt
+        self.source = source
+        self.target = target
+        self.ts = ts                     # unix 秒，float
+        self.elapsed = elapsed
+        self.truncated = truncated
+
+    @property
+    def chars(self) -> tuple[int, int]:
+        return len(self.source), len(self.target)
+
+    def to_json(self) -> str:
+        return json.dumps({
+            "v": HISTORY_VERSION,
+            "src": self.src, "tgt": self.tgt,
+            "source": self.source, "target": self.target,
+            "ts": round(self.ts, 3), "elapsed": round(self.elapsed, 2),
+        }, ensure_ascii=False, separators=(",", ":"))
+
+    @staticmethod
+    def from_obj(o: dict) -> "HistoryEntry | None":
+        """宽容解析：缺字段或类型不对就丢弃这条，不让整份历史挂掉。"""
+        try:
+            src = str(o["src"]); tgt = str(o["tgt"])
+            source = o["source"]; target = o["target"]
+            if not isinstance(source, str) or not isinstance(target, str):
+                return None
+            if not src or not tgt:
+                return None
+            ts = float(o.get("ts") or 0.0)
+        except (KeyError, TypeError, ValueError):
+            return None
+        return HistoryEntry(src, tgt, source, target, ts,
+                            float(o.get("elapsed") or 0.0))
+
+    def head(self, n: int = 60) -> str:
+        """给列表用的单行预览。"""
+        first = self.source.strip().splitlines()[0] if self.source.strip() else ""
+        return first[:n] + ("…" if len(first) > n else "")
+
+    def __repr__(self):
+        return (f"HistoryEntry({self.src}->{self.tgt}, "
+                f"{len(self.source)}->{len(self.target)} chars)")
+
+
+class RecordOutcome:
+    """一次记录尝试的结果。record() 不抛异常，所以结果只能从这里看。"""
+
+    __slots__ = ("ok", "reason")
+
+    def __init__(self, ok: bool, reason: str = ""):
+        self.ok = ok
+        self.reason = reason
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+    def __repr__(self):
+        return f"RecordOutcome(ok={self.ok}, reason={self.reason!r})"
+
+
+class HistoryStats:
+    """历史的总体情况，给界面和缓存报告用。"""
+
+    __slots__ = ("count", "bytes", "max_entries", "max_bytes", "path")
+
+    def __init__(self, count, nbytes, max_entries, max_bytes, path):
+        self.count = count
+        self.bytes = nbytes
+        self.max_entries = max_entries
+        self.max_bytes = max_bytes
+        self.path = path
+
+    def __repr__(self):
+        return (f"HistoryStats(count={self.count}, bytes={self.bytes}, "
+                f"limits={self.max_entries}/{self.max_bytes})")
+
+
+class HistoryStore:
+    """翻译历史的事实来源。
+
+    对外四个动作：
+        record(...)     追加一条，**永不抛**
+        page(...)       按时间倒序分页读取
+        purge()         清空全部历史
+        summary()       条目数 / 占用字节 / 上限
+
+    约束：
+      * record() 与 purge() 之间是串行的（内部有锁）；page() 也走同一把锁。
+      * 写入是追加式的，崩溃最多损失最后一条，不会毁掉整份历史。
+      * 淘汰（超上限）会重写文件，用临时文件 + os.replace，原子生效。
+      * 目录**延迟创建**：构造时不碰磁盘。这不只是洁癖 —— CacheManager 的
+        sweep_deferred() 依赖"父目录能被删掉"，如果在它之前就建出目录，
+        .trash-* 残留会永远清不掉。
+    """
+
+    def __init__(self, path, max_entries=DEFAULT_MAX_ENTRIES,
+                 max_bytes=DEFAULT_MAX_BYTES):
+        self.path = path
+        self.max_entries = max(1, int(max_entries))
+        self.max_bytes = max(1024, int(max_bytes))
+        self._lock = threading.RLock()
+        self._cache: list[HistoryEntry] | None = None   # 时间倒序
+        self._dirty = True
+
+    # -- 写入 ----------------------------------------------------------
+
+    def record(self, src, tgt, source, target, elapsed=0.0) -> RecordOutcome:
+        """追加一条历史。**任何情况下都不抛异常。**
+
+        单条内容完整保存、不截断（容量靠条数 + 字节两个上限兜住）。
+        """
+        try:
+            if not source or not source.strip():
+                return RecordOutcome(False, "空原文")
+            entry = HistoryEntry(str(src), str(tgt), source, target,
+                                 _time.time(), float(elapsed or 0.0))
+        except Exception as exc:                       # pragma: no cover
+            log.warning("history: 构造记录失败: %r", exc)
+            return RecordOutcome(False, f"构造失败: {exc}")
+
+        with self._lock:
+            try:
+                self._ensure_dir()
+                self._append(entry)
+            except Exception as exc:
+                log.warning("history: 写入失败: %r", exc)
+                return RecordOutcome(False, f"写入失败: {exc}")
+
+            try:
+                self._invalidate()
+                self._enforce_limits()
+            except Exception as exc:
+                # 淘汰失败不该影响"这条已经写进去了"这个事实
+                log.warning("history: 淘汰失败（记录已保存）: %r", exc)
+            return RecordOutcome(True)
+
+    def purge(self) -> RecordOutcome:
+        """清空全部历史。删不掉时改名释放空间（与缓存清理同一套策略）。"""
+        with self._lock:
+            try:
+                if os.path.exists(self.path):
+                    try:
+                        os.remove(self.path)
+                    except OSError:
+                        moved = _defer(self.path)
+                        if moved is None:
+                            return RecordOutcome(False, "文件被占用，无法删除")
+                # 清掉可能存在的 .trash-* 与临时文件
+                self._invalidate()
+                return RecordOutcome(True)
+            except Exception as exc:
+                log.warning("history: purge 失败: %r", exc)
+                return RecordOutcome(False, str(exc))
+
+    # -- 读取 ----------------------------------------------------------
+
+    def page(self, offset: int = 0, limit: int = 50) -> list[HistoryEntry]:
+        """按时间**倒序**（最新在前）返回一页。越界返回空列表。"""
+        with self._lock:
+            items = self._load()
+            if offset < 0:
+                offset = 0
+            return items[offset:offset + max(0, limit)]
+
+    def all_entries(self) -> list[HistoryEntry]:
+        with self._lock:
+            return list(self._load())
+
+    def summary(self) -> HistoryStats:
+        with self._lock:
+            items = self._load()
+            try:
+                nbytes = os.path.getsize(self.path)
+            except OSError:
+                nbytes = 0
+            return HistoryStats(len(items), nbytes, self.max_entries,
+                                self.max_bytes, self.path)
+
+    # -- 内部实现（不属于接口） ----------------------------------------
+
+    def _ensure_dir(self) -> None:
+        parent = os.path.dirname(self.path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+    def _append(self, entry: HistoryEntry) -> None:
+        # 行缓冲 + 显式 flush：保证进程被强杀时这条也已经落盘
+        with open(self.path, "a", encoding="utf-8", newline="\n") as fh:
+            fh.write(entry.to_json() + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+
+    def _invalidate(self) -> None:
+        self._cache = None
+        self._dirty = True
+
+    def _load(self) -> list[HistoryEntry]:
+        """读全部并解析，时间倒序。坏行跳过，不让一行毁掉整份历史。"""
+        if self._cache is not None and not self._dirty:
+            return self._cache
+        items: list[HistoryEntry] = []
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        log.warning("history: 跳过损坏的一行")
+                        continue
+                    if isinstance(obj, dict):
+                        e = HistoryEntry.from_obj(obj)
+                        if e is not None:
+                            items.append(e)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log.warning("history: 读取失败: %r", exc)
+        items.sort(key=lambda e: e.ts, reverse=True)     # 最新在前
+        self._cache = items
+        self._dirty = False
+        return items
+
+    def _enforce_limits(self) -> None:
+        """超上限就从最旧的一端淘汰。条数与字节两个上限都算。"""
+        items = self._load()
+        if not items:
+            return
+        keep = items
+        # 1) 条数上限（items 已是最新在前，所以保留前 N 条 = 保留最新的 N 条）
+        if len(keep) > self.max_entries:
+            keep = keep[:self.max_entries]
+        # 2) 字节上限：从最新往旧累加，超了就砍
+        if self.max_bytes > 0 and len(keep) > 1:
+            total = 0
+            cut = len(keep)
+            # 每条行的实际字节 = utf-8 编码后的长度 + 换行
+            for i, e in enumerate(keep):
+                total += len(e.to_json().encode("utf-8")) + 1
+                if total > self.max_bytes:
+                    cut = i                      # 保留 0..i-1
+                    break
+            if cut < len(keep):
+                keep = keep[:max(1, cut)]        # 至少留最新一条
+        if len(keep) == len(items):
+            return
+        dropped = len(items) - len(keep)
+        self._rewrite(keep)
+        log.info("history: 淘汰 %d 条（保留 %d 条）", dropped, len(keep))
+
+    def _rewrite(self, keep: list[HistoryEntry]) -> None:
+        """原子重写：临时文件 + os.replace。"""
+        tmp = f"{self.path}.tmp-{os.getpid()}"
+        self._ensure_dir()
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            for e in keep:
+                fh.write(e.to_json() + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, self.path)
+        self._invalidate()
+
+
+# 进程内单例：历史的事实只该有一份。
+# 路径跟着程序目录走（和 models/ logs/ 一致），所以便携版拷走也带着历史。
+HISTORY = HistoryStore(os.path.join(DATA_ROOT, "history.jsonl"))
+
+# 把历史登记进磁盘清单，并把历史的删除交给它自己执行。
+# 顺序要求：必须在任何 CACHE.inventory() 之前 —— 界面和自检都读同一份清单。
+CACHE.set_history(HISTORY)
+
+
+# ======================================================================
+# 9. 界面
 # ======================================================================
 #
 # Tk 的控件本身很朴素，所以观感靠这几件事撑起来：
@@ -926,6 +1686,16 @@ def _pick_font(root: tk.Tk) -> str:
         if name in available:
             return name
     return "TkDefaultFont"
+
+
+def _fmt_size(n: int) -> str:
+    """把字节数变成人能读的大小。"""
+    v = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if v < 1024 or unit == "GB":
+            return f"{v:.0f} {unit}" if unit == "B" else f"{v:.1f} {unit}"
+        v /= 1024
+    return f"{v:.1f} GB"
 
 
 # --- 配色：偏冷的深色，紫蓝强调 ---------------------------------------
@@ -1384,6 +2154,12 @@ class TranslateApp:
         self._hover_label(footer, "管理模型", self._open_model_manager,
                           fg=THEME["fg_dim"], tip="查看/下载翻译模型")\
             .pack(side=tk.LEFT, padx=(16, 0))
+        self._hover_label(footer, "缓存管理", self._open_cache_manager,
+                          fg=THEME["fg_dim"], tip="查看磁盘占用并清理可再生缓存")\
+            .pack(side=tk.LEFT, padx=(4, 0))
+        self._hover_label(footer, "历史", self._open_history,
+                          fg=THEME["fg_dim"], tip="查看/恢复翻译历史")\
+            .pack(side=tk.LEFT, padx=(4, 0))
         self._hover_label(footer, "模型目录",
                           lambda: self._open_folder(PACKAGES_DIR),
                           fg=THEME["fg_dim"], tip=PACKAGES_DIR)\
@@ -1534,6 +2310,10 @@ class TranslateApp:
         self._busy = True
         self._cancel = threading.Event()
         self._started = time.time()
+        # 原文要留到结果回来时写历史。只存引用，不复制（长文复制一次不划算）。
+        # 并发性：_busy 保证同一时刻只有一个翻译在跑，所以不会被下一次覆盖。
+        self._pending_source = text
+        self._pending_src = src
         self.translate_btn.config(state=tk.DISABLED, text="翻译中…",
                                   bg=THEME["surface2"], fg=THEME["fg_mute"])
         self.cancel_btn.pack(side=tk.RIGHT, padx=(8, 0))
@@ -1650,6 +2430,9 @@ class TranslateApp:
                      f"　{len(text)} 字　{elapsed:.1f}s{note}",
                 fg=THEME["fg_mute"])
             self._set_status("翻译完成", THEME["good"])
+            # 先记历史再解 busy：反过来的话按钮已经可点，用户可能在历史写完
+            # 之前又发起一次翻译，_pending_source 就被覆盖了。
+            self._record_history(src, tgt, text, elapsed)
             self._finish_busy()
         elif kind == "cancelled":
             self._set_status("已取消", THEME["warn"])
@@ -1672,6 +2455,25 @@ class TranslateApp:
         self.translate_btn.config(state=tk.NORMAL, text="译  Translate",
                                   bg=THEME["accent"], fg="#FFFFFF")
         save_settings(self.settings)
+
+    def _record_history(self, src: str, tgt: str, result: str,
+                        elapsed: float) -> None:
+        """把这次翻译写进历史。
+
+        这里**必须**吞掉一切异常。调用点在"翻译已经成功"之后：如果记录失败
+        把异常抛出来，用户看到的是"翻译失败"，而翻译其实成功了 —— 拿一个
+        附加功能去毁掉主功能，是最糟的失败方式。
+
+        （HistoryStore.record 本身已保证不抛；这里再包一层是防御性的，
+        因为将来可能有人改动它，或者 HISTORY 单例被换掉。）
+        """
+        try:
+            source = getattr(self, "_pending_source", "") or ""
+            HISTORY.record(src, tgt, source, result, elapsed)
+        except Exception:
+            log.exception("history record failed")     # 只记日志，不影响界面
+        finally:
+            self._pending_source = ""
 
     def _start_warmup(self) -> None:
         """后台把已安装模型扫进内存，让第一次翻译不用现扫。"""
@@ -1828,6 +2630,405 @@ class TranslateApp:
                  anchor=tk.W, justify=tk.LEFT).pack(fill=tk.X, padx=16, pady=(0, 12))
         dlg.bind("<Escape>", lambda e: dlg.destroy())
 
+    # ---------------- 缓存管理 ----------------
+    def _open_cache_manager(self) -> None:
+        """磁盘占用一览 + 清理可再生缓存。
+
+        两个刻意的设计：
+          * 模型（models）只报告、不提供删除。它占 99% 的空间但属于用户资产，
+            删掉要重新下几百 MB。清空按钮在接口层就够不到它（CacheManager
+            只接受 disposable 的名字），所以界面不需要靠自觉来防误删。
+          * 目录遍历实测约 350 ms（20 GB 量级），放到后台线程算，
+            开窗不卡。
+        """
+        dlg = tk.Toplevel(self.root)
+        dlg.title("缓存管理")
+        dlg.configure(bg=THEME["bg"])
+        dlg.geometry("760x560")
+        dlg.minsize(620, 420)
+        dlg.transient(self.root)
+        dlg.attributes("-topmost", bool(self.topmost_var.get()))
+        ico = _icon_path()
+        if ico:
+            try:
+                dlg.iconbitmap(default=ico)
+            except tk.TclError:
+                pass
+
+        head = tk.Frame(dlg, bg=THEME["bg"])
+        head.pack(fill=tk.X, padx=16, pady=(14, 0))
+        tk.Label(head, text="磁盘占用", fg=THEME["fg"], bg=THEME["bg"],
+                 font=(self.family, 11, "bold")).pack(side=tk.LEFT)
+        self._cache_total = tk.Label(head, text="统计中…", fg=THEME["fg_mute"],
+                                     bg=THEME["bg"], font=self.f_tiny)
+        self._cache_total.pack(side=tk.RIGHT)
+
+        tk.Label(dlg,
+                 text="翻译模型是你的资产，不会在这里被删除。「可再生」的项目删掉后会在"
+                      "下次用到时自动重建；「用户记录」（翻译历史）删了不可恢复，"
+                      "所以单独一个按钮、单独确认。",
+                 fg=THEME["fg_mute"], bg=THEME["bg"], font=self.f_tiny,
+                 anchor=tk.W, justify=tk.LEFT, wraplength=700)\
+            .pack(fill=tk.X, padx=16, pady=(2, 8))
+
+        holder = self._card(dlg)
+        holder.master.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 10))
+        cols = ("name", "size", "kind")
+        tree = ttk.Treeview(holder, columns=cols, show="headings",
+                            style="Card.Treeview", selectmode="browse")
+        tree.heading("name", text="项目")
+        tree.heading("size", text="占用")
+        tree.heading("kind", text="保留等级")
+        tree.column("name", width=210, anchor=tk.W, stretch=False)
+        tree.column("size", width=110, anchor=tk.E, stretch=False)
+        tree.column("kind", width=380, anchor=tk.W)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(1, 0), pady=1)
+        tsb = ttk.Scrollbar(holder, command=tree.yview, style="Vertical.TScrollbar")
+        tsb.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 1), pady=1)
+        tree.config(yscrollcommand=tsb.set)
+
+        state = tk.Label(dlg, text="", fg=THEME["fg_mute"], bg=THEME["bg"],
+                         font=self.f_tiny, anchor=tk.W, justify=tk.LEFT,
+                         wraplength=700)
+        state.pack(fill=tk.X, padx=16, pady=(0, 6))
+
+        cache_q: queue.Queue = queue.Queue()
+        alive = {"yes": True}
+
+        def ui(fn, *a, **kw):
+            """把界面更新排进队列，由主线程的轮询消费。
+
+            不能在后台线程里直接调 dlg.after() —— Tk 不是线程安全的
+            （主窗口用的是同一套 queue + 轮询的做法）。对话框自己一个队列，
+            关窗时用 stop 标志让轮询退出。
+            """
+            cache_q.put((fn, a, kw))
+
+        def pump() -> None:
+            try:
+                while True:
+                    fn, a, kw = cache_q.get_nowait()
+                    fn(*a, **kw)
+            except queue.Empty:
+                pass
+            except tk.TclError:
+                return                        # 窗口已销毁
+            # 同历史对话框：窗口没了还调 after() 会在 Tcl 层报后台错误
+            if alive["yes"] and dlg.winfo_exists():
+                dlg.after(60, pump)
+
+        def on_close() -> None:
+            alive["yes"] = False
+            dlg.destroy()
+
+        def render(items) -> None:
+            tree.delete(*tree.get_children())
+            total = 0
+            for it in items:
+                total += it.size
+                # 等级标签直接来自模块，界面不自己判断能不能删
+                tree.insert("", tk.END, values=(
+                    f"{it.label}  ({it.name})", _fmt_size(it.size),
+                    it.retention_label))
+                tree.insert("", tk.END, values=("    " + it.purpose, "", ""))
+            self._cache_total.config(text=f"合计 {_fmt_size(total)}")
+
+        def load(force: bool = False) -> None:
+            def work() -> None:
+                try:
+                    items = CACHE.inventory(force=force)
+                except Exception as exc:                     # pragma: no cover
+                    log.exception("cache inventory failed")
+                    ui(state.config, text=f"统计失败：{exc}", fg=THEME["bad"])
+                    return
+                ui(render, items)
+                dl = sum(i.size for i in items if i.disposable)
+                rec = sum(i.size for i in items
+                          if i.retention == Retention.USER_RECORD)
+                ui(state.config,
+                   text=f"可再生 {_fmt_size(dl)}　·　用户记录 {_fmt_size(rec)}"
+                        f"　·　翻译模型不计入清理",
+                   fg=THEME["fg_mute"])
+            threading.Thread(target=work, daemon=True, name="cache-scan").start()
+
+        def do_clear() -> None:
+            if self._busy:
+                state.config(text="正在翻译中，先等它结束再清理", fg=THEME["warn"])
+                return
+            dl = CACHE.disposable_size()
+            if dl == 0:
+                state.config(text="可清理的项目已经是空的", fg=THEME["good"])
+                return
+            if not messagebox.askyesno(
+                    "确认清理",
+                    f"将清理约 {_fmt_size(dl)} 的可再生缓存：\n\n"
+                    "· 分句模型（下次翻译时会重新下载或从随包副本恢复）\n"
+                    "· 模型清单索引（下次刷新清单时重建）\n"
+                    "· 运行日志\n\n"
+                    "翻译模型和翻译历史都不会被删除。继续吗？",
+                    parent=dlg):
+                return
+
+            def work() -> None:
+                ui(state.config, text="正在清理…", fg=THEME["warn"])
+                try:
+                    rep = CACHE.clear()          # 只删 DISPOSABLE
+                except Exception as exc:
+                    log.exception("cache clear failed")
+                    ui(state.config, text=f"清理失败：{exc}", fg=THEME["bad"])
+                    return
+                ui(state.config, text=rep.summary(), fg=THEME["good"])
+                ui(load, True)
+            threading.Thread(target=work, daemon=True, name="cache-clear").start()
+
+        def do_purge_history() -> None:
+            """删除用户记录。与清理缓存分开：这个不可恢复，措辞和确认都更重。"""
+            if self._busy:
+                state.config(text="正在翻译中，先等它结束", fg=THEME["warn"])
+                return
+            try:
+                st = HISTORY.summary()
+            except Exception as exc:
+                state.config(text=f"读取历史失败：{exc}", fg=THEME["bad"])
+                return
+            if st.count == 0:
+                state.config(text="历史已经是空的", fg=THEME["good"])
+                return
+            if not messagebox.askyesno(
+                    "确认删除历史",
+                    f"将删除全部 {st.count} 条翻译历史（{_fmt_size(st.bytes)}）。\n\n"
+                    "这个操作**不可恢复**。翻译模型和缓存不受影响。\n\n继续吗？",
+                    parent=dlg, icon="warning", default="no"):
+                return
+
+            def work() -> None:
+                ui(state.config, text="正在删除历史…", fg=THEME["warn"])
+                try:
+                    rep = CACHE.purge(["history"])
+                except Exception as exc:
+                    log.exception("history purge failed")
+                    ui(state.config, text=f"删除失败：{exc}", fg=THEME["bad"])
+                    return
+                ui(state.config, text=f"历史已删除（{rep.summary()}）",
+                   fg=THEME["good"])
+                ui(load, True)
+            threading.Thread(target=work, daemon=True, name="hist-purge").start()
+
+        btns = tk.Frame(dlg, bg=THEME["bg"])
+        btns.pack(fill=tk.X, padx=16, pady=(0, 14))
+        self._button(btns, "重新统计", lambda: load(True)).pack(side=tk.LEFT)
+        self._button(btns, "清理可再生缓存", do_clear).pack(side=tk.LEFT, padx=(8, 0))
+        self._button(btns, "删除翻译历史", do_purge_history)\
+            .pack(side=tk.LEFT, padx=(8, 0))
+        self._button(btns, "打开程序目录",
+                     lambda: self._open_folder(DATA_ROOT)).pack(side=tk.LEFT, padx=(8, 0))
+
+        load()
+        dlg.after(60, pump)
+        dlg.protocol("WM_DELETE_WINDOW", on_close)
+        dlg.bind("<Escape>", lambda e: on_close())
+
+    # ---------------- 翻译历史 ----------------
+    PAGE = 50                                # 一页多少条
+
+    def _open_history(self) -> None:
+        """历史窗口：分页浏览、恢复到输入框、清空。
+
+        分页而不是一次全塞：条数上限是 200，但每条内容不截断，长文条的文本
+        很大，一次性填进 Treeview 会卡。
+        """
+        dlg = tk.Toplevel(self.root)
+        dlg.title("翻译历史")
+        dlg.configure(bg=THEME["bg"])
+        dlg.geometry("860x620")
+        dlg.minsize(680, 460)
+        dlg.transient(self.root)
+        dlg.attributes("-topmost", bool(self.topmost_var.get()))
+        ico = _icon_path()
+        if ico:
+            try:
+                dlg.iconbitmap(default=ico)
+            except tk.TclError:
+                pass
+
+        head = tk.Frame(dlg, bg=THEME["bg"])
+        head.pack(fill=tk.X, padx=16, pady=(14, 0))
+        tk.Label(head, text="翻译历史", fg=THEME["fg"], bg=THEME["bg"],
+                 font=(self.family, 11, "bold")).pack(side=tk.LEFT)
+        self._hist_info = tk.Label(head, text="", fg=THEME["fg_mute"],
+                                   bg=THEME["bg"], font=self.f_tiny)
+        self._hist_info.pack(side=tk.RIGHT)
+
+        tk.Label(dlg,
+                 text="双击一条可把原文放回输入框；也可以只恢复译文。"
+                      "历史只存在本机，不会上传。",
+                 fg=THEME["fg_mute"], bg=THEME["bg"], font=self.f_tiny,
+                 anchor=tk.W, justify=tk.LEFT, wraplength=820)\
+            .pack(fill=tk.X, padx=16, pady=(2, 8))
+
+        holder = self._card(dlg)
+        holder.master.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 8))
+        cols = ("time", "pair", "size", "preview")
+        tree = ttk.Treeview(holder, columns=cols, show="headings",
+                            style="Card.Treeview", selectmode="browse")
+        for cid, text, w, anchor in (("time", "时间", 130, tk.W),
+                                     ("pair", "语言", 90, tk.CENTER),
+                                     ("size", "字数", 90, tk.E),
+                                     ("preview", "原文", 420, tk.W)):
+            tree.heading(cid, text=text)
+            tree.column(cid, width=w, anchor=anchor,
+                        stretch=(cid == "preview"))
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(1, 0), pady=1)
+        tsb = ttk.Scrollbar(holder, command=tree.yview, style="Vertical.TScrollbar")
+        tsb.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 1), pady=1)
+        tree.config(yscrollcommand=tsb.set)
+
+        detail = tk.Text(dlg, height=6, bg=THEME["surface2"], fg=THEME["result"],
+                         font=self.f_small, relief=tk.FLAT, bd=0, wrap=tk.WORD,
+                         padx=10, pady=8, highlightthickness=1,
+                         highlightbackground=THEME["border"])
+        detail.pack(fill=tk.X, padx=16, pady=(0, 8))
+        detail.insert("1.0", "选中一条历史查看内容。")
+        detail.config(state=tk.DISABLED)
+
+        state = tk.Label(dlg, text="", fg=THEME["fg_mute"], bg=THEME["bg"],
+                         font=self.f_tiny, anchor=tk.W)
+        state.pack(fill=tk.X, padx=16, pady=(0, 6))
+
+        page_no = {"n": 0}
+        shown: list = []                    # 当前页的 HistoryEntry
+
+        def render() -> None:
+            tree.delete(*tree.get_children())
+            stats = HISTORY.summary()
+            total_pages = max(1, (stats.count + self.PAGE - 1) // self.PAGE)
+            if page_no["n"] >= total_pages:
+                page_no["n"] = max(0, total_pages - 1)
+            shown.clear()
+            shown.extend(HISTORY.page(page_no["n"] * self.PAGE, self.PAGE))
+            for idx, e in enumerate(shown):
+                when = time.strftime("%m-%d %H:%M",
+                                     time.localtime(e.ts)) if e.ts else "—"
+                a, b = e.chars
+                tree.insert("", tk.END, iid=str(idx), values=(
+                    when, f"{e.src}→{e.tgt}", f"{a}→{b}", e.head(64)))
+            self._hist_info.config(
+                text=f"{stats.count} 条 · {_fmt_size(stats.bytes)}")
+            empty = "（还没有历史）" if stats.count == 0 else ""
+            state.config(
+                text=f"第 {page_no['n'] + 1}/{total_pages} 页　"
+                     f"上限 {stats.max_entries} 条 / {_fmt_size(stats.max_bytes)}"
+                     f"　{empty}")
+
+        def on_select(_e=None) -> None:
+            sel = tree.selection()
+            if not sel:
+                return
+            i = int(sel[0])
+            if i >= len(shown):
+                return
+            e = shown[i]
+            detail.config(state=tk.NORMAL)
+            detail.delete("1.0", tk.END)
+            detail.insert("1.0",
+                          f"【原文 {e.src}】\n{e.source}\n\n"
+                          f"【译文 {e.tgt}】\n{e.target}")
+            detail.config(state=tk.DISABLED)
+
+        def put(text: str, label: str) -> None:
+            self.input_text.delete("1.0", tk.END)
+            self.input_text.insert("1.0", text)
+            self.input_text.config(fg=THEME["fg"])
+            self._has_placeholder = False
+            self._on_modified()
+            self._set_status(f"已恢复到输入框（{label}）", THEME["good"])
+
+        def restore_source(_e=None) -> None:
+            sel = tree.selection()
+            if not sel or int(sel[0]) >= len(shown):
+                state.config(text="先选中一条历史", fg=THEME["warn"])
+                return
+            put(shown[int(sel[0])].source, "原文")
+
+        def restore_target() -> None:
+            sel = tree.selection()
+            if not sel or int(sel[0]) >= len(shown):
+                state.config(text="先选中一条历史", fg=THEME["warn"])
+                return
+            put(shown[int(sel[0])].target, "译文")
+
+        def goto(delta: int) -> None:
+            page_no["n"] = max(0, page_no["n"] + delta)
+            render()
+
+        def do_clear() -> None:
+            stats = HISTORY.summary()
+            if stats.count == 0:
+                state.config(text="历史已经是空的", fg=THEME["good"])
+                return
+            if not messagebox.askyesno(
+                    "确认清空历史",
+                    f"将删除全部 {stats.count} 条翻译历史（{_fmt_size(stats.bytes)}）。\n\n"
+                    "这个操作**不可恢复**，原文和译文都会丢失。\n"
+                    "翻译模型和缓存不受影响。\n\n继续吗？",
+                    parent=dlg, icon="warning", default="no"):
+                return
+
+            def work() -> None:
+                ui(state.config, text="正在清空…", fg=THEME["warn"])
+                try:
+                    rep = CACHE.purge(["history"])      # 走缓存管理，委托给 store
+                except Exception as exc:
+                    log.exception("history purge failed")
+                    ui(state.config, text=f"清空失败：{exc}", fg=THEME["bad"])
+                    return
+                ui(state.config, text=f"已清空（{rep.summary()}）", fg=THEME["good"])
+                ui(render)
+            threading.Thread(target=work, daemon=True, name="hist-purge").start()
+
+        hist_q: queue.Queue = queue.Queue()
+        alive = {"yes": True}
+
+        def ui(fn, *a, **kw):
+            hist_q.put((fn, a, kw))
+
+        def pump() -> None:
+            try:
+                while True:
+                    fn, a, kw = hist_q.get_nowait()
+                    fn(*a, **kw)
+            except queue.Empty:
+                pass
+            except tk.TclError:
+                return
+            # 窗口可能已经被销毁；不先确认就 after() 会在解释器里报
+            # "invalid command name ..._pump"。这不是异常，是 Tcl 的
+            # 后台错误，只能靠事前检查避免。
+            if alive["yes"] and dlg.winfo_exists():
+                dlg.after(60, pump)
+
+        def on_close() -> None:
+            alive["yes"] = False
+            dlg.destroy()
+
+        tree.bind("<<TreeviewSelect>>", on_select)
+        tree.bind("<Double-1>", restore_source)
+
+        bar = tk.Frame(dlg, bg=THEME["bg"])
+        bar.pack(fill=tk.X, padx=16, pady=(0, 14))
+        self._button(bar, "上一页", lambda: goto(-1)).pack(side=tk.LEFT)
+        self._button(bar, "下一页", lambda: goto(1)).pack(side=tk.LEFT, padx=(6, 0))
+        self._button(bar, "刷新", render).pack(side=tk.LEFT, padx=(6, 0))
+        self._button(bar, "清空历史", do_clear).pack(side=tk.LEFT, padx=(18, 0))
+        self._button(bar, "恢复译文", restore_target).pack(side=tk.RIGHT)
+        self._button(bar, "恢复原文", restore_source,
+                     kind="primary").pack(side=tk.RIGHT, padx=(0, 6))
+
+        render()
+        dlg.after(60, pump)
+        dlg.protocol("WM_DELETE_WINDOW", on_close)
+        dlg.bind("<Escape>", lambda e: on_close())
+
     # ---------------- 生命周期 ----------------
     def _log_geometry(self) -> None:
         self.root.update_idletasks()
@@ -1857,7 +3058,7 @@ _DPI_AWARE_OK = _enable_dpi_awareness()
 
 
 # ======================================================================
-# 8. 入口
+# 10. 入口
 # ======================================================================
 
 def _selftest() -> int:
@@ -1907,6 +3108,25 @@ def _selftest() -> int:
     t0 = time.time()
     count = ENGINE.installed_count()
     say(f"installed     : {count} models  ({time.time()-t0:.2f}s)")
+    if count == 0:
+        # 排查用：把"引擎实际在看哪个目录"和"扫描本身的异常"都摊开。
+        # 光看 "0 models" 无法区分"目录里真没有"和"扫描路径不对/扫描抛异常"。
+        try:
+            import argostranslate.settings as _S
+            say(f"  argos 包目录 : {_S.package_data_dir}")
+        except Exception as exc:
+            say(f"  argos 包目录 : 读取失败 {type(exc).__name__}: {exc}")
+        try:
+            _dirs = sorted(os.listdir(PACKAGES_DIR))
+            say(f"  目录项       : {len(_dirs)} 个"
+                + (f"（前 3：{_dirs[:3]}）" if _dirs else "（目录是空的）"))
+        except Exception as exc:
+            say(f"  目录项       : 读取失败 {type(exc).__name__}: {exc}")
+        try:
+            import argostranslate.package as _P
+            say(f"  扫描结果     : {len(_P.get_installed_packages())} 个包")
+        except Exception as exc:
+            say(f"  扫描异常     : {type(exc).__name__}: {exc}")
 
     import minisbd.models as _mm
     onnx = [f for f in os.listdir(os.path.join(CACHE_DIR, "minisbd"))
@@ -1914,6 +3134,42 @@ def _selftest() -> int:
     say(f"sbd models    : {len(onnx)} onnx files")
     if not onnx:
         problems.append("no MiniSBD sentence-splitter models present")
+
+    # 磁盘占用一览。这里顺便能暴露"同一份缓存存在两份"这类布局问题：
+    # 打包后 CACHE_DIR 在 _internal 下，而程序目录里可能还留着一份旧的。
+    say("")
+    say("--- cache ---")
+    try:
+        for item in CACHE.inventory():
+            say(f"  {item.retention:<12} {item.label:<12} "
+                f"{_fmt_size(item.size):>9}  {item.path}")
+        say(f"  合计占用 {_fmt_size(CACHE.total_size())}，"
+            f"可再生 {_fmt_size(CACHE.disposable_size())}")
+    except Exception as exc:
+        say(f"  统计失败：{type(exc).__name__}: {exc}")
+        problems.append("cache inventory failed")
+
+    say("")
+    say("--- history ---")
+    try:
+        st = HISTORY.summary()
+        say(f"  条目      : {st.count} / {st.max_entries}")
+        say(f"  占用      : {_fmt_size(st.bytes)} / {_fmt_size(st.max_bytes)}")
+        say(f"  文件      : {st.path}")
+        # 写入一次再读回来，确认这条链路是通的（自检不该只读）
+        probe = HISTORY.record("en", "zh", "selftest probe", "自检探针", 0.0)
+        if not probe:
+            say(f"  写入探针  : 失败（{probe.reason}）")
+            problems.append(f"history write failed: {probe.reason}")
+        else:
+            back = HISTORY.page(0, 1)
+            ok = bool(back) and back[0].source == "selftest probe"
+            say(f"  写入并读回: {'ok' if ok else '不一致'}")
+            if not ok:
+                problems.append("history round-trip mismatch")
+    except Exception as exc:
+        say(f"  检查失败：{type(exc).__name__}: {exc}")
+        problems.append("history check failed")
 
     say("")
     say("--- detection ---")
@@ -2061,6 +3317,15 @@ def main(argv: list[str] | None = None) -> int:
 
     log.info("start: app_dir=%s data_root=%s cache=%s portable=%s engine=%s minisbd=%s",
              APP_DIR, DATA_ROOT, CACHE_DIR, IS_PORTABLE, HAS_ENGINE, HAS_MINISBD)
+
+    # 上次清理时被占用、只改了名的残留，现在进程刚起、句柄还没被占，正好清掉
+    try:
+        swept = CACHE.sweep_deferred()
+        if swept:
+            log.info("startup sweep removed %d deferred cache entries", swept)
+    except Exception:
+        log.exception("startup cache sweep failed")
+
     try:
         app = TranslateApp()
     except Exception:

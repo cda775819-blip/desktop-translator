@@ -124,6 +124,16 @@ def _pick_font(root: tk.Tk) -> str:
     return "TkDefaultFont"
 
 
+def _fmt_size(n: int) -> str:
+    """把字节数变成人能读的大小。"""
+    v = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if v < 1024 or unit == "GB":
+            return f"{v:.0f} {unit}" if unit == "B" else f"{v:.1f} {unit}"
+        v /= 1024
+    return f"{v:.1f} GB"
+
+
 # --- 配色：偏冷的深色，紫蓝强调 ---------------------------------------
 THEME = {
     "bg":        "#0F1115",
@@ -580,6 +590,12 @@ class TranslateApp:
         self._hover_label(footer, "管理模型", self._open_model_manager,
                           fg=THEME["fg_dim"], tip="查看/下载翻译模型")\
             .pack(side=tk.LEFT, padx=(16, 0))
+        self._hover_label(footer, "缓存管理", self._open_cache_manager,
+                          fg=THEME["fg_dim"], tip="查看磁盘占用并清理可再生缓存")\
+            .pack(side=tk.LEFT, padx=(4, 0))
+        self._hover_label(footer, "历史", self._open_history,
+                          fg=THEME["fg_dim"], tip="查看/恢复翻译历史")\
+            .pack(side=tk.LEFT, padx=(4, 0))
         self._hover_label(footer, "模型目录",
                           lambda: self._open_folder(PACKAGES_DIR),
                           fg=THEME["fg_dim"], tip=PACKAGES_DIR)\
@@ -730,6 +746,10 @@ class TranslateApp:
         self._busy = True
         self._cancel = threading.Event()
         self._started = time.time()
+        # 原文要留到结果回来时写历史。只存引用，不复制（长文复制一次不划算）。
+        # 并发性：_busy 保证同一时刻只有一个翻译在跑，所以不会被下一次覆盖。
+        self._pending_source = text
+        self._pending_src = src
         self.translate_btn.config(state=tk.DISABLED, text="翻译中…",
                                   bg=THEME["surface2"], fg=THEME["fg_mute"])
         self.cancel_btn.pack(side=tk.RIGHT, padx=(8, 0))
@@ -846,6 +866,9 @@ class TranslateApp:
                      f"　{len(text)} 字　{elapsed:.1f}s{note}",
                 fg=THEME["fg_mute"])
             self._set_status("翻译完成", THEME["good"])
+            # 先记历史再解 busy：反过来的话按钮已经可点，用户可能在历史写完
+            # 之前又发起一次翻译，_pending_source 就被覆盖了。
+            self._record_history(src, tgt, text, elapsed)
             self._finish_busy()
         elif kind == "cancelled":
             self._set_status("已取消", THEME["warn"])
@@ -868,6 +891,25 @@ class TranslateApp:
         self.translate_btn.config(state=tk.NORMAL, text="译  Translate",
                                   bg=THEME["accent"], fg="#FFFFFF")
         save_settings(self.settings)
+
+    def _record_history(self, src: str, tgt: str, result: str,
+                        elapsed: float) -> None:
+        """把这次翻译写进历史。
+
+        这里**必须**吞掉一切异常。调用点在"翻译已经成功"之后：如果记录失败
+        把异常抛出来，用户看到的是"翻译失败"，而翻译其实成功了 —— 拿一个
+        附加功能去毁掉主功能，是最糟的失败方式。
+
+        （HistoryStore.record 本身已保证不抛；这里再包一层是防御性的，
+        因为将来可能有人改动它，或者 HISTORY 单例被换掉。）
+        """
+        try:
+            source = getattr(self, "_pending_source", "") or ""
+            HISTORY.record(src, tgt, source, result, elapsed)
+        except Exception:
+            log.exception("history record failed")     # 只记日志，不影响界面
+        finally:
+            self._pending_source = ""
 
     def _start_warmup(self) -> None:
         """后台把已安装模型扫进内存，让第一次翻译不用现扫。"""
@@ -1023,6 +1065,405 @@ class TranslateApp:
                  fg=THEME["fg_mute"], bg=THEME["bg"], font=self.f_tiny,
                  anchor=tk.W, justify=tk.LEFT).pack(fill=tk.X, padx=16, pady=(0, 12))
         dlg.bind("<Escape>", lambda e: dlg.destroy())
+
+    # ---------------- 缓存管理 ----------------
+    def _open_cache_manager(self) -> None:
+        """磁盘占用一览 + 清理可再生缓存。
+
+        两个刻意的设计：
+          * 模型（models）只报告、不提供删除。它占 99% 的空间但属于用户资产，
+            删掉要重新下几百 MB。清空按钮在接口层就够不到它（CacheManager
+            只接受 disposable 的名字），所以界面不需要靠自觉来防误删。
+          * 目录遍历实测约 350 ms（20 GB 量级），放到后台线程算，
+            开窗不卡。
+        """
+        dlg = tk.Toplevel(self.root)
+        dlg.title("缓存管理")
+        dlg.configure(bg=THEME["bg"])
+        dlg.geometry("760x560")
+        dlg.minsize(620, 420)
+        dlg.transient(self.root)
+        dlg.attributes("-topmost", bool(self.topmost_var.get()))
+        ico = _icon_path()
+        if ico:
+            try:
+                dlg.iconbitmap(default=ico)
+            except tk.TclError:
+                pass
+
+        head = tk.Frame(dlg, bg=THEME["bg"])
+        head.pack(fill=tk.X, padx=16, pady=(14, 0))
+        tk.Label(head, text="磁盘占用", fg=THEME["fg"], bg=THEME["bg"],
+                 font=(self.family, 11, "bold")).pack(side=tk.LEFT)
+        self._cache_total = tk.Label(head, text="统计中…", fg=THEME["fg_mute"],
+                                     bg=THEME["bg"], font=self.f_tiny)
+        self._cache_total.pack(side=tk.RIGHT)
+
+        tk.Label(dlg,
+                 text="翻译模型是你的资产，不会在这里被删除。「可再生」的项目删掉后会在"
+                      "下次用到时自动重建；「用户记录」（翻译历史）删了不可恢复，"
+                      "所以单独一个按钮、单独确认。",
+                 fg=THEME["fg_mute"], bg=THEME["bg"], font=self.f_tiny,
+                 anchor=tk.W, justify=tk.LEFT, wraplength=700)\
+            .pack(fill=tk.X, padx=16, pady=(2, 8))
+
+        holder = self._card(dlg)
+        holder.master.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 10))
+        cols = ("name", "size", "kind")
+        tree = ttk.Treeview(holder, columns=cols, show="headings",
+                            style="Card.Treeview", selectmode="browse")
+        tree.heading("name", text="项目")
+        tree.heading("size", text="占用")
+        tree.heading("kind", text="保留等级")
+        tree.column("name", width=210, anchor=tk.W, stretch=False)
+        tree.column("size", width=110, anchor=tk.E, stretch=False)
+        tree.column("kind", width=380, anchor=tk.W)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(1, 0), pady=1)
+        tsb = ttk.Scrollbar(holder, command=tree.yview, style="Vertical.TScrollbar")
+        tsb.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 1), pady=1)
+        tree.config(yscrollcommand=tsb.set)
+
+        state = tk.Label(dlg, text="", fg=THEME["fg_mute"], bg=THEME["bg"],
+                         font=self.f_tiny, anchor=tk.W, justify=tk.LEFT,
+                         wraplength=700)
+        state.pack(fill=tk.X, padx=16, pady=(0, 6))
+
+        cache_q: queue.Queue = queue.Queue()
+        alive = {"yes": True}
+
+        def ui(fn, *a, **kw):
+            """把界面更新排进队列，由主线程的轮询消费。
+
+            不能在后台线程里直接调 dlg.after() —— Tk 不是线程安全的
+            （主窗口用的是同一套 queue + 轮询的做法）。对话框自己一个队列，
+            关窗时用 stop 标志让轮询退出。
+            """
+            cache_q.put((fn, a, kw))
+
+        def pump() -> None:
+            try:
+                while True:
+                    fn, a, kw = cache_q.get_nowait()
+                    fn(*a, **kw)
+            except queue.Empty:
+                pass
+            except tk.TclError:
+                return                        # 窗口已销毁
+            # 同历史对话框：窗口没了还调 after() 会在 Tcl 层报后台错误
+            if alive["yes"] and dlg.winfo_exists():
+                dlg.after(60, pump)
+
+        def on_close() -> None:
+            alive["yes"] = False
+            dlg.destroy()
+
+        def render(items) -> None:
+            tree.delete(*tree.get_children())
+            total = 0
+            for it in items:
+                total += it.size
+                # 等级标签直接来自模块，界面不自己判断能不能删
+                tree.insert("", tk.END, values=(
+                    f"{it.label}  ({it.name})", _fmt_size(it.size),
+                    it.retention_label))
+                tree.insert("", tk.END, values=("    " + it.purpose, "", ""))
+            self._cache_total.config(text=f"合计 {_fmt_size(total)}")
+
+        def load(force: bool = False) -> None:
+            def work() -> None:
+                try:
+                    items = CACHE.inventory(force=force)
+                except Exception as exc:                     # pragma: no cover
+                    log.exception("cache inventory failed")
+                    ui(state.config, text=f"统计失败：{exc}", fg=THEME["bad"])
+                    return
+                ui(render, items)
+                dl = sum(i.size for i in items if i.disposable)
+                rec = sum(i.size for i in items
+                          if i.retention == Retention.USER_RECORD)
+                ui(state.config,
+                   text=f"可再生 {_fmt_size(dl)}　·　用户记录 {_fmt_size(rec)}"
+                        f"　·　翻译模型不计入清理",
+                   fg=THEME["fg_mute"])
+            threading.Thread(target=work, daemon=True, name="cache-scan").start()
+
+        def do_clear() -> None:
+            if self._busy:
+                state.config(text="正在翻译中，先等它结束再清理", fg=THEME["warn"])
+                return
+            dl = CACHE.disposable_size()
+            if dl == 0:
+                state.config(text="可清理的项目已经是空的", fg=THEME["good"])
+                return
+            if not messagebox.askyesno(
+                    "确认清理",
+                    f"将清理约 {_fmt_size(dl)} 的可再生缓存：\n\n"
+                    "· 分句模型（下次翻译时会重新下载或从随包副本恢复）\n"
+                    "· 模型清单索引（下次刷新清单时重建）\n"
+                    "· 运行日志\n\n"
+                    "翻译模型和翻译历史都不会被删除。继续吗？",
+                    parent=dlg):
+                return
+
+            def work() -> None:
+                ui(state.config, text="正在清理…", fg=THEME["warn"])
+                try:
+                    rep = CACHE.clear()          # 只删 DISPOSABLE
+                except Exception as exc:
+                    log.exception("cache clear failed")
+                    ui(state.config, text=f"清理失败：{exc}", fg=THEME["bad"])
+                    return
+                ui(state.config, text=rep.summary(), fg=THEME["good"])
+                ui(load, True)
+            threading.Thread(target=work, daemon=True, name="cache-clear").start()
+
+        def do_purge_history() -> None:
+            """删除用户记录。与清理缓存分开：这个不可恢复，措辞和确认都更重。"""
+            if self._busy:
+                state.config(text="正在翻译中，先等它结束", fg=THEME["warn"])
+                return
+            try:
+                st = HISTORY.summary()
+            except Exception as exc:
+                state.config(text=f"读取历史失败：{exc}", fg=THEME["bad"])
+                return
+            if st.count == 0:
+                state.config(text="历史已经是空的", fg=THEME["good"])
+                return
+            if not messagebox.askyesno(
+                    "确认删除历史",
+                    f"将删除全部 {st.count} 条翻译历史（{_fmt_size(st.bytes)}）。\n\n"
+                    "这个操作**不可恢复**。翻译模型和缓存不受影响。\n\n继续吗？",
+                    parent=dlg, icon="warning", default="no"):
+                return
+
+            def work() -> None:
+                ui(state.config, text="正在删除历史…", fg=THEME["warn"])
+                try:
+                    rep = CACHE.purge(["history"])
+                except Exception as exc:
+                    log.exception("history purge failed")
+                    ui(state.config, text=f"删除失败：{exc}", fg=THEME["bad"])
+                    return
+                ui(state.config, text=f"历史已删除（{rep.summary()}）",
+                   fg=THEME["good"])
+                ui(load, True)
+            threading.Thread(target=work, daemon=True, name="hist-purge").start()
+
+        btns = tk.Frame(dlg, bg=THEME["bg"])
+        btns.pack(fill=tk.X, padx=16, pady=(0, 14))
+        self._button(btns, "重新统计", lambda: load(True)).pack(side=tk.LEFT)
+        self._button(btns, "清理可再生缓存", do_clear).pack(side=tk.LEFT, padx=(8, 0))
+        self._button(btns, "删除翻译历史", do_purge_history)\
+            .pack(side=tk.LEFT, padx=(8, 0))
+        self._button(btns, "打开程序目录",
+                     lambda: self._open_folder(DATA_ROOT)).pack(side=tk.LEFT, padx=(8, 0))
+
+        load()
+        dlg.after(60, pump)
+        dlg.protocol("WM_DELETE_WINDOW", on_close)
+        dlg.bind("<Escape>", lambda e: on_close())
+
+    # ---------------- 翻译历史 ----------------
+    PAGE = 50                                # 一页多少条
+
+    def _open_history(self) -> None:
+        """历史窗口：分页浏览、恢复到输入框、清空。
+
+        分页而不是一次全塞：条数上限是 200，但每条内容不截断，长文条的文本
+        很大，一次性填进 Treeview 会卡。
+        """
+        dlg = tk.Toplevel(self.root)
+        dlg.title("翻译历史")
+        dlg.configure(bg=THEME["bg"])
+        dlg.geometry("860x620")
+        dlg.minsize(680, 460)
+        dlg.transient(self.root)
+        dlg.attributes("-topmost", bool(self.topmost_var.get()))
+        ico = _icon_path()
+        if ico:
+            try:
+                dlg.iconbitmap(default=ico)
+            except tk.TclError:
+                pass
+
+        head = tk.Frame(dlg, bg=THEME["bg"])
+        head.pack(fill=tk.X, padx=16, pady=(14, 0))
+        tk.Label(head, text="翻译历史", fg=THEME["fg"], bg=THEME["bg"],
+                 font=(self.family, 11, "bold")).pack(side=tk.LEFT)
+        self._hist_info = tk.Label(head, text="", fg=THEME["fg_mute"],
+                                   bg=THEME["bg"], font=self.f_tiny)
+        self._hist_info.pack(side=tk.RIGHT)
+
+        tk.Label(dlg,
+                 text="双击一条可把原文放回输入框；也可以只恢复译文。"
+                      "历史只存在本机，不会上传。",
+                 fg=THEME["fg_mute"], bg=THEME["bg"], font=self.f_tiny,
+                 anchor=tk.W, justify=tk.LEFT, wraplength=820)\
+            .pack(fill=tk.X, padx=16, pady=(2, 8))
+
+        holder = self._card(dlg)
+        holder.master.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 8))
+        cols = ("time", "pair", "size", "preview")
+        tree = ttk.Treeview(holder, columns=cols, show="headings",
+                            style="Card.Treeview", selectmode="browse")
+        for cid, text, w, anchor in (("time", "时间", 130, tk.W),
+                                     ("pair", "语言", 90, tk.CENTER),
+                                     ("size", "字数", 90, tk.E),
+                                     ("preview", "原文", 420, tk.W)):
+            tree.heading(cid, text=text)
+            tree.column(cid, width=w, anchor=anchor,
+                        stretch=(cid == "preview"))
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(1, 0), pady=1)
+        tsb = ttk.Scrollbar(holder, command=tree.yview, style="Vertical.TScrollbar")
+        tsb.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 1), pady=1)
+        tree.config(yscrollcommand=tsb.set)
+
+        detail = tk.Text(dlg, height=6, bg=THEME["surface2"], fg=THEME["result"],
+                         font=self.f_small, relief=tk.FLAT, bd=0, wrap=tk.WORD,
+                         padx=10, pady=8, highlightthickness=1,
+                         highlightbackground=THEME["border"])
+        detail.pack(fill=tk.X, padx=16, pady=(0, 8))
+        detail.insert("1.0", "选中一条历史查看内容。")
+        detail.config(state=tk.DISABLED)
+
+        state = tk.Label(dlg, text="", fg=THEME["fg_mute"], bg=THEME["bg"],
+                         font=self.f_tiny, anchor=tk.W)
+        state.pack(fill=tk.X, padx=16, pady=(0, 6))
+
+        page_no = {"n": 0}
+        shown: list = []                    # 当前页的 HistoryEntry
+
+        def render() -> None:
+            tree.delete(*tree.get_children())
+            stats = HISTORY.summary()
+            total_pages = max(1, (stats.count + self.PAGE - 1) // self.PAGE)
+            if page_no["n"] >= total_pages:
+                page_no["n"] = max(0, total_pages - 1)
+            shown.clear()
+            shown.extend(HISTORY.page(page_no["n"] * self.PAGE, self.PAGE))
+            for idx, e in enumerate(shown):
+                when = time.strftime("%m-%d %H:%M",
+                                     time.localtime(e.ts)) if e.ts else "—"
+                a, b = e.chars
+                tree.insert("", tk.END, iid=str(idx), values=(
+                    when, f"{e.src}→{e.tgt}", f"{a}→{b}", e.head(64)))
+            self._hist_info.config(
+                text=f"{stats.count} 条 · {_fmt_size(stats.bytes)}")
+            empty = "（还没有历史）" if stats.count == 0 else ""
+            state.config(
+                text=f"第 {page_no['n'] + 1}/{total_pages} 页　"
+                     f"上限 {stats.max_entries} 条 / {_fmt_size(stats.max_bytes)}"
+                     f"　{empty}")
+
+        def on_select(_e=None) -> None:
+            sel = tree.selection()
+            if not sel:
+                return
+            i = int(sel[0])
+            if i >= len(shown):
+                return
+            e = shown[i]
+            detail.config(state=tk.NORMAL)
+            detail.delete("1.0", tk.END)
+            detail.insert("1.0",
+                          f"【原文 {e.src}】\n{e.source}\n\n"
+                          f"【译文 {e.tgt}】\n{e.target}")
+            detail.config(state=tk.DISABLED)
+
+        def put(text: str, label: str) -> None:
+            self.input_text.delete("1.0", tk.END)
+            self.input_text.insert("1.0", text)
+            self.input_text.config(fg=THEME["fg"])
+            self._has_placeholder = False
+            self._on_modified()
+            self._set_status(f"已恢复到输入框（{label}）", THEME["good"])
+
+        def restore_source(_e=None) -> None:
+            sel = tree.selection()
+            if not sel or int(sel[0]) >= len(shown):
+                state.config(text="先选中一条历史", fg=THEME["warn"])
+                return
+            put(shown[int(sel[0])].source, "原文")
+
+        def restore_target() -> None:
+            sel = tree.selection()
+            if not sel or int(sel[0]) >= len(shown):
+                state.config(text="先选中一条历史", fg=THEME["warn"])
+                return
+            put(shown[int(sel[0])].target, "译文")
+
+        def goto(delta: int) -> None:
+            page_no["n"] = max(0, page_no["n"] + delta)
+            render()
+
+        def do_clear() -> None:
+            stats = HISTORY.summary()
+            if stats.count == 0:
+                state.config(text="历史已经是空的", fg=THEME["good"])
+                return
+            if not messagebox.askyesno(
+                    "确认清空历史",
+                    f"将删除全部 {stats.count} 条翻译历史（{_fmt_size(stats.bytes)}）。\n\n"
+                    "这个操作**不可恢复**，原文和译文都会丢失。\n"
+                    "翻译模型和缓存不受影响。\n\n继续吗？",
+                    parent=dlg, icon="warning", default="no"):
+                return
+
+            def work() -> None:
+                ui(state.config, text="正在清空…", fg=THEME["warn"])
+                try:
+                    rep = CACHE.purge(["history"])      # 走缓存管理，委托给 store
+                except Exception as exc:
+                    log.exception("history purge failed")
+                    ui(state.config, text=f"清空失败：{exc}", fg=THEME["bad"])
+                    return
+                ui(state.config, text=f"已清空（{rep.summary()}）", fg=THEME["good"])
+                ui(render)
+            threading.Thread(target=work, daemon=True, name="hist-purge").start()
+
+        hist_q: queue.Queue = queue.Queue()
+        alive = {"yes": True}
+
+        def ui(fn, *a, **kw):
+            hist_q.put((fn, a, kw))
+
+        def pump() -> None:
+            try:
+                while True:
+                    fn, a, kw = hist_q.get_nowait()
+                    fn(*a, **kw)
+            except queue.Empty:
+                pass
+            except tk.TclError:
+                return
+            # 窗口可能已经被销毁；不先确认就 after() 会在解释器里报
+            # "invalid command name ..._pump"。这不是异常，是 Tcl 的
+            # 后台错误，只能靠事前检查避免。
+            if alive["yes"] and dlg.winfo_exists():
+                dlg.after(60, pump)
+
+        def on_close() -> None:
+            alive["yes"] = False
+            dlg.destroy()
+
+        tree.bind("<<TreeviewSelect>>", on_select)
+        tree.bind("<Double-1>", restore_source)
+
+        bar = tk.Frame(dlg, bg=THEME["bg"])
+        bar.pack(fill=tk.X, padx=16, pady=(0, 14))
+        self._button(bar, "上一页", lambda: goto(-1)).pack(side=tk.LEFT)
+        self._button(bar, "下一页", lambda: goto(1)).pack(side=tk.LEFT, padx=(6, 0))
+        self._button(bar, "刷新", render).pack(side=tk.LEFT, padx=(6, 0))
+        self._button(bar, "清空历史", do_clear).pack(side=tk.LEFT, padx=(18, 0))
+        self._button(bar, "恢复译文", restore_target).pack(side=tk.RIGHT)
+        self._button(bar, "恢复原文", restore_source,
+                     kind="primary").pack(side=tk.RIGHT, padx=(0, 6))
+
+        render()
+        dlg.after(60, pump)
+        dlg.protocol("WM_DELETE_WINDOW", on_close)
+        dlg.bind("<Escape>", lambda e: on_close())
 
     # ---------------- 生命周期 ----------------
     def _log_geometry(self) -> None:

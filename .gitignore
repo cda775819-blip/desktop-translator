@@ -14,8 +14,13 @@ _internal/
 # 运行时数据
 cache/
 logs/
+data/
 config/settings.json
 logs/selftest.txt
+# 翻译历史是用户数据，绝不能进仓库（也可能含隐私内容）
+history.jsonl
+history.jsonl.*
+**/*.trash-*
 
 # Python
 __pycache__/

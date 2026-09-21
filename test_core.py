@@ -27,6 +27,13 @@ def check(label, got, want):
         failures.append(label)
 
 
+def check_true(label, cond, detail=""):
+    """用于"条件成立即通过"的断言（check 是等值比较，用不上）。"""
+    print(f"  {'PASS' if cond else 'FAIL'}  {label:<50} {detail}")
+    if not cond:
+        failures.append(label)
+
+
 print("=== paths ===")
 print("  APP_DIR     :", app.APP_DIR)
 print("  DATA_ROOT   :", app.DATA_ROOT)
@@ -36,6 +43,25 @@ app.DATA_ROOT.encode("ascii")
 print("  ascii ok    : True")
 print("  HAS_ENGINE  :", app.HAS_ENGINE, "| langdetect:", app.HAS_LANGDETECT)
 check("engine available", app.HAS_ENGINE, True)
+
+# 回归守卫：曾经把 os.environ["ARGOS_PACKAGES_DIR"] = PACKAGES_DIR 这行误删过。
+# 后果是 argostranslate 跑去看 XDG_DATA_HOME 下的空目录，100 个模型一个都认不出来
+# （自检显示 "installed: 0 models"）而且**不报任何错**。
+# 只断言"引擎能扫到模型"不够 —— 开发机上恰好有 junction 兜住；
+# 必须直接断言这个环境变量本身。
+print("\n=== ARGOS_PACKAGES_DIR 必须指向 PACKAGES_DIR ===")
+_env_dir = os.environ.get("ARGOS_PACKAGES_DIR")
+check_true("环境变量已设置", bool(_env_dir), repr(_env_dir))
+check_true("环境变量指向 PACKAGES_DIR",
+           bool(_env_dir) and os.path.normcase(os.path.abspath(_env_dir))
+           == os.path.normcase(os.path.abspath(app.PACKAGES_DIR)),
+           f"env={_env_dir!r}")
+if app.HAS_ENGINE:
+    import argostranslate.settings as _argos_settings
+    check_true("argostranslate 读到同一个目录",
+               os.path.normcase(os.path.abspath(str(_argos_settings.package_data_dir)))
+               == os.path.normcase(os.path.abspath(app.PACKAGES_DIR)),
+               f"settings={_argos_settings.package_data_dir}")
 
 print("\n=== language detection ===")
 cases = [
