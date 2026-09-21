@@ -6,6 +6,8 @@ Windows 桌面翻译工具。**纯离线**，不联网也能翻，不需要装 P
 - 50 种语言互译，任意语言对自动经英文中转
 - 启动 0.8 秒，短句翻译 0.3 秒，长文约 150–400 字符/秒
 - 长文自动分段，重复性内容不会触发"复读机"退化
+- **翻译历史**：只存本机，可回填到输入框；有容量上限，不会无限长
+- **磁盘占用可见可管**：模型 / 缓存 / 历史分三级保留策略，误删不了模型
 - 单目录体积 181 MB（不含语言模型）
 
 | | |
@@ -36,12 +38,42 @@ Windows 桌面翻译工具。**纯离线**，不联网也能翻，不需要装 P
 ├── 桌面翻译助手.exe
 ├── _internal\
 ├── models\packages\           ← 放语言模型；没有就先空着，运行时会自动下载
-└── cache\minisbd\             ← 已在 _internal 里预置，不用管
+├── cache\minisbd\             ← 已在 _internal 里预置，不用管
+└── history.jsonl              ← 翻译历史，首次翻译后自动出现
 ```
 
 > **注意：解压路径不能含中文。** `sentencepiece` 的 C++ 层用窄字符 API 打开文件，
 > 路径里有中文会直接 `OSError: Not found`。程序检测到程序目录含非 ASCII 会自动
 > 改用 `%LOCALAPPDATA%\Translator` 存数据，但模型放在英文路径下最省事。
+
+---
+
+## 磁盘上的东西分成三级
+
+界面底栏的「缓存管理」把占用摊开，并按**保留等级**决定能不能删：
+
+| 等级 | 内容 | 删除 |
+|---|---|---|
+| 用户资产 | `models/packages`（翻译模型，最大的一块） | **不提供删除** —— 接口层就没这个可能，不是靠界面自觉 |
+| 用户记录 | `history.jsonl`（翻译历史） | 可删，但**不可恢复**，独立按钮 + 单独确认 |
+| 可再生 | `cache/minisbd`、索引、`logs` | 随便清，下次用到时自动重建 |
+
+这个分级不是装饰：把历史混进"清理缓存"的话，用户点一下就把自己的翻译记录
+连缓存一起清掉了 —— 而历史既不可恢复、也不是缓存。
+
+清理用「删不掉就改名释放空间」的策略：文件被本进程占用时，改名成 `.trash-*`
+先把空间让出来，下次启动时清掉，所以清理不会因为占用而失败。
+
+## 翻译历史
+
+- 只存在本机的 `history.jsonl`，不上传任何地方
+- 格式是一行一条 JSON：崩在写一半最多损失最后一条，不会毁掉整份历史
+- **两条上限同时生效**：200 条 + 8 MB，超了从最旧的淘汰。单条内容完整保存、不截断
+- 记录失败**绝不影响翻译**：写入点在翻译成功之后，写不进去只写日志，
+  界面照常显示译文（拿附加功能毁掉主功能是最糟的失败方式）
+- 界面里可以翻页浏览、双击把原文回填到输入框、或只恢复译文
+
+上限是 `history_section.py` 里的 `DEFAULT_MAX_ENTRIES` / `DEFAULT_MAX_BYTES`。
 
 ---
 
@@ -55,6 +87,9 @@ python app.py
 
 首次运行会在 `app.py` 同级创建 `models/packages`。放模型进去，或在界面里点
 「管理模型」→「刷新可下载清单」→「下载并安装」。
+
+> 想跑测试套件的话，`D:\translator-build\models` 和 `cache` 可以做成指向
+> 部署目录的目录链接（`mklink /J`），这样源码目录也能找到模型。
 
 ### 为什么必须打补丁
 
@@ -129,12 +164,23 @@ spec 支持环境变量覆盖：`TRANSLATOR_SRC` / `TRANSLATOR_DATA` / `TRANSLAT
 ## 测试
 
 ```bash
-python test_chunk.py      # 分段不变量（40 项）+ 退化检测
-python test_engine.py     # 引擎链路 / 进度回调 / 取消 / 边界输入
-python test_fidelity.py   # 长文保真度（40 句不重复散文，主题词覆盖）
-python test_core.py       # 功能回归（语言检测 / 路由 / 离线报错）
-python test_layout.py     # 布局（8 种屏幕×缩放，几何重叠检测）
+python test_cache.py        # 三级保留策略 / clear 与 purge 的越权拒绝 / 委托删除后状态同步
+python test_history.py      # 历史存储：容量淘汰 / 损坏行 / 撕裂行 / emoji / 非 ASCII 路径
+python test_history_app.py  # 集成：捕获点、失败与取消不写、写入失败不影响翻译结果
+python test_chunk.py        # 分段不变量（40 项）+ 退化检测
+python test_engine.py       # 引擎链路 / 进度回调 / 取消 / 边界输入
+python test_fidelity.py     # 长文保真度（40 句不重复散文，主题词覆盖）
+python test_core.py         # 功能回归（语言检测 / 路由 / 离线报错 / 环境变量守卫）
+python test_layout.py       # 布局（8 种屏幕×缩放，几何重叠检测）
 ```
+
+8 个套件全绿是改动的底线。
+
+`test_core.py` 里有一条容易看漏但很重要的守卫：断言 `ARGOS_PACKAGES_DIR`
+必须等于 `PACKAGES_DIR`。这行曾被误删，后果是 argostranslate 跑去看
+`XDG_DATA_HOME` 下的空目录，**100 个模型一个都不认识而且不报任何错**
+（自检显示 `installed: 0 models`）。只断言"引擎能扫到模型"是不够的 ——
+开发机上恰好有目录链接兜住，必须直接断言这个环境变量本身。
 
 测试通过 `_paths.py` 定位 `app.py` 和模型，所以仓库放在任何位置都能跑；
 也可以设 `TRANSLATOR_APP` / `ARGOS_PACKAGES_DIR` 显式指定。
@@ -214,29 +260,40 @@ Tk 报的屏幕尺寸是物理还是逻辑像素，取决于进程 DPI 感知状
 
 ## 文件说明
 
+`app.py` 是拼装出来的成品：几个段落各自独立成文件（便于单独测试），
+由 `splice_*.py` 按顺序拼进去。改代码请改段落文件，然后重新拼接，别直接改 `app.py`。
+
 | 文件 | 说明 |
 |---|---|
-| `app.py` | 主程序（路径 / 日志 / 引擎 / 分段 / 界面 / 自检） |
-| `ui_section.py` | 界面部分单独维护，`splice_ui.py` 负责拼进 `app.py` |
+| `app.py` | **生成的**成品（路径 / 日志 / 引擎 / 设置 / 缓存 / 历史 / 界面 / 自检） |
+| `cache_section.py` | 磁盘占用与三级保留策略 → 拼成段落 7 |
+| `history_section.py` | 翻译历史存储 → 拼成段落 8 |
+| `ui_section.py` | 界面 → 拼成段落 9 |
+| `_splice_common.py` | 拼接脚本共用的段落定位与编号 |
+| `splice_cache.py` · `splice_history.py` · `splice_ui.py` | 按顺序拼接（顺序不能乱：历史要用缓存的 `_defer`） |
 | `_paths.py` | 测试与工具脚本的路径解析（不假设任何绝对路径） |
 | `patch_deps.py` | 给 site-packages 打那三个惰性导入补丁 |
 | `seed_minisbd.py` | 预下载 MiniSBD 分句模型 |
 | `gen_icon.py` | 生成多分辨率图标（需要 Pillow） |
 | `translator.spec` | PyInstaller 配置 |
 | `rthook_stub_torch.py` | 运行时 stub：`ctranslate2.specs` 会 `try: import torch` |
-| `test_*.py` | 测试套件 |
+| `test_cache.py` · `test_history.py` · `test_history_app.py` | 缓存与历史 |
+| `test_chunk.py` · `test_engine.py` · `test_fidelity.py` | 分段 / 引擎 / 长文保真度 |
+| `test_core.py` · `test_layout.py` | 功能回归 / 布局 |
 | `verify_icon.py` · `verify_exe_icon.py` | 图标结构验证（含手写 PNG 解码 / PE 资源遍历） |
-| `CHANGELOG-重构对比.md` | 完整的改动对比与实测数据 |
+| `probe_*.py` | 一次性的测量脚本，保留下来是为了让结论可复现 |
+| `CHANGELOG.md` | 完整的改动对比与实测数据 |
 
 ---
 
 ## 已知限制
 
-- 只做单向翻译界面，没有划词翻译 / 剪贴板监听 / 翻译历史
+- 没有划词翻译 / 剪贴板监听（历史有了）
 - 长文要等翻完才显示（没有增量输出）
 - 吞吐受 CPU 模型限制：1000 字约 3–6 秒。检测到 CUDA 会自动启用 GPU
   （`ARGOS_DEVICE_TYPE=cuda`），但未在 GPU 机器上验证过
 - 多显示器切换后不会重新夹取窗口位置（只在启动时算一次）
+- 历史按容量自动淘汰最旧的，没有"只保留最近 N 天"这类时间维度策略
 
 ## 许可
 
